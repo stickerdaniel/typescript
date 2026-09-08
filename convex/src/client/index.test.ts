@@ -1,9 +1,19 @@
-import { AutumnError, ConnectionError, UnexpectedClientError } from "autumn-js";
+import {
+  AutumnError,
+  ConnectionError,
+  RequestTimeoutError,
+  UnexpectedClientError,
+} from "autumn-js";
+import { ConvexError } from "convex/values";
 import { describe, expect, test, vi } from "vitest";
 import { deriveProviderKey } from "../idempotency.js";
 import { isTransportIndeterminate } from "../transport.js";
 import type { UpdateBalanceArgs } from "../types.js";
-import { Autumn, AutumnIndeterminateError } from "./index.js";
+import {
+  Autumn,
+  AutumnIndeterminateError,
+  AutumnValidationError,
+} from "./index.js";
 
 type CapturedRequest = {
   method: string;
@@ -1234,6 +1244,138 @@ describe("Autumn native transport", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  test("normalizes a failing operationId read before dispatch", async () => {
+    const fetcher = vi.fn();
+    const args = new Proxy(
+      { featureId: "messages", operationId: "operation" },
+      {
+        get(source, key, receiver) {
+          if (key === "operationId") throw new Error("private trap failure");
+          return Reflect.get(source, key, receiver);
+        },
+      }
+    );
+
+    const caught = await client(fetcher)
+      .track(null, args)
+      .catch((error: unknown) => error);
+
+    expect(caught).toBeInstanceOf(AutumnValidationError);
+    expect(caught).toMatchObject({
+      message:
+        "Autumn request identity must use stable primitive string properties.",
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test("normalizes a failing customerId read after identify", async () => {
+    const fetcher = vi.fn();
+    const identifier = new Proxy(
+      { customerId: "customer-1" },
+      {
+        get(source, key, receiver) {
+          if (key === "customerId") throw new Error("private trap failure");
+          return Reflect.get(source, key, receiver);
+        },
+      }
+    );
+    const autumn = new Autumn({} as never, {
+      secretKey: "test-secret-key",
+      serverURL: "https://example.test",
+      operationNamespace: "namespace-1",
+      identify: async () => identifier,
+      fetcher,
+    });
+
+    const caught = await autumn
+      .track(null, { featureId: "messages", operationId: "operation" })
+      .catch((error: unknown) => error);
+
+    expect(caught).toBeInstanceOf(AutumnValidationError);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test("reports generated identity traps as validation failures", async () => {
+    const fetcher = vi.fn();
+    const args = new Proxy(
+      {
+        customerId: "customer-1",
+        featureId: "messages",
+        operationId: "operation",
+      },
+      {
+        get(source, key, receiver) {
+          if (key === "operationId") {
+            throw new RequestTimeoutError("private trap failure");
+          }
+          return Reflect.get(source, key, receiver);
+        },
+      }
+    );
+    const generatedTrack = client(fetcher).internalApi().track as unknown as {
+      _handler: (ctx: unknown, input: typeof args) => Promise<unknown>;
+    };
+
+    const caught = await generatedTrack
+      ._handler({} as never, args)
+      .catch((error: unknown) => error);
+
+    expect(caught).toBeInstanceOf(ConvexError);
+    expect(
+      (
+        caught as ConvexError<{
+          code: string;
+          operation: string;
+          message: string;
+        }>
+      ).data
+    ).toEqual({
+      code: "AUTUMN_VALIDATION_ERROR",
+      operation: "track",
+      message:
+        "Autumn request identity must use stable primitive string properties.",
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test("uses a generated operationId value without a later proxy read", async () => {
+    const fetcher = vi.fn(async () =>
+      response({
+        customer_id: "customer-1",
+        value: 1,
+        balance: null,
+      })
+    );
+    let reads = 0;
+    const args = new Proxy(
+      {
+        customerId: "customer-1",
+        featureId: "messages",
+        operationId: "operation",
+      },
+      {
+        get(source, key, receiver) {
+          if (key === "operationId") {
+            reads += 1;
+            if (reads > 1) throw new RequestTimeoutError("later trap");
+          }
+          return Reflect.get(source, key, receiver);
+        },
+      }
+    );
+    const generatedTrack = client(fetcher).internalApi().track as unknown as {
+      _handler: (ctx: unknown, input: typeof args) => Promise<unknown>;
+    };
+
+    await expect(generatedTrack._handler({} as never, args)).resolves.toEqual({
+      customerId: "customer-1",
+      value: 1,
+      balance: null,
+    });
+    expect(reads).toBe(1);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   test("rejects a proxy whose data descriptor and read disagree", async () => {
     const fetcher = vi.fn();
     const target = { featureId: "messages", operationId: "descriptor-value" };
@@ -1291,14 +1433,19 @@ describe("Autumn native transport", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  test("keeps request construction before keyed identity reads", async () => {
+  test("materializes keyed identity once before request construction", async () => {
     const reads: string[] = [];
     const fetcher = vi.fn(async () => response({ message: "rejected" }, 400));
     const identifier = new Proxy(
       { customerId: "customer-1" },
       {
         get(source, key, receiver) {
-          if (key === "customerId") reads.push("customerId");
+          if (key === "customerId") {
+            reads.push("customerId");
+            if (reads.filter((read) => read === key).length > 1) {
+              throw new Error("customerId must not be read twice");
+            }
+          }
           return Reflect.get(source, key, receiver);
         },
       }
@@ -1314,7 +1461,12 @@ describe("Autumn native transport", () => {
       },
       {
         get(source, key, receiver) {
-          if (key === "operationId") reads.push("operationId");
+          if (key === "operationId") {
+            reads.push("operationId");
+            if (reads.filter((read) => read === key).length > 1) {
+              throw new Error("operationId must not be read twice");
+            }
+          }
           return Reflect.get(source, key, receiver);
         },
       }
@@ -1329,14 +1481,7 @@ describe("Autumn native transport", () => {
 
     await autumn.track(null, args).catch(() => undefined);
 
-    expect(reads).toEqual([
-      "customerId",
-      "operationId",
-      "payload",
-      "customerId",
-      "customerId",
-      "operationId",
-    ]);
+    expect(reads).toEqual(["customerId", "operationId", "payload"]);
     expect(fetcher).toHaveBeenCalledOnce();
   });
 

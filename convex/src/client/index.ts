@@ -112,6 +112,10 @@ type IdentityEntry = {
   field: IdentityField;
   value: string;
 };
+type CapturedIdentity = {
+  source: Identifier;
+  customerId: string;
+};
 
 const REQUEST_VALIDATION_MESSAGE =
   "The Autumn request contains a value Autumn cannot receive faithfully.";
@@ -129,19 +133,32 @@ class RequestIdentityChecks {
 
   constructor(private readonly operation: NativeOperation) {}
 
-  capture(carrier: object, field: IdentityField): void {
+  capture(carrier: object, field: IdentityField): string {
+    const existing = this.entries.find(
+      (entry) => entry.carrier === carrier && entry.field === field
+    );
+    if (existing) return existing.value;
+
     const descriptor = this.descriptor(carrier, field);
     if (!("value" in descriptor) || typeof descriptor.value !== "string") {
       this.reject();
     }
-    if (
-      this.entries.some(
-        (entry) => entry.carrier === carrier && entry.field === field
-      )
-    ) {
-      return;
-    }
     const value = descriptor.value;
+    let actual: unknown;
+    try {
+      actual = Reflect.get(carrier, field);
+    } catch {
+      this.reject();
+    }
+    if (actual !== value) this.reject();
+    const repeatedDescriptor = this.descriptor(carrier, field);
+    if (
+      !("value" in repeatedDescriptor) ||
+      repeatedDescriptor.value !== value
+    ) {
+      this.reject();
+    }
+
     this.entries.push({ carrier, field, value });
     if (field === "customerId") {
       if (this.customerId !== undefined && this.customerId !== value) {
@@ -149,17 +166,7 @@ class RequestIdentityChecks {
       }
       this.customerId = value;
     }
-  }
-
-  confirm(carrier: object, field: IdentityField, actual: unknown): void {
-    const entry = this.entries.find(
-      (candidate) => candidate.carrier === carrier && candidate.field === field
-    );
-    if (!entry || actual !== entry.value) this.reject();
-    const descriptor = this.descriptor(carrier, field);
-    if (!("value" in descriptor) || descriptor.value !== entry.value) {
-      this.reject();
-    }
+    return value;
   }
 
   assertCurrent(): void {
@@ -200,13 +207,29 @@ class RequestIdentityChecks {
   }
 }
 
+function copyWithout<T extends object, Key extends PropertyKey>(
+  source: T,
+  excluded: ReadonlySet<Key>
+): Omit<T, Key> {
+  const result = {} as Record<PropertyKey, unknown>;
+  for (const key of Reflect.ownKeys(source)) {
+    if (excluded.has(key as Key)) continue;
+    const descriptor = Reflect.getOwnPropertyDescriptor(source, key);
+    if (!descriptor?.enumerable) continue;
+    Object.defineProperty(result, key, {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: Reflect.get(source, key),
+    });
+  }
+  return result as Omit<T, Key>;
+}
+
 function withoutOperationId<T extends MutationArgs>(
-  args: T,
-  checks: RequestIdentityChecks
+  args: T
 ): Omit<T, "operationId"> {
-  const { operationId, ...request } = args;
-  checks.confirm(args, "operationId", operationId);
-  return request;
+  return copyWithout(args, new Set(["operationId"] as const));
 }
 
 /**
@@ -218,13 +241,9 @@ function withoutOperationId<T extends MutationArgs>(
  * identifier.
  */
 function withoutIdentity<T extends InternalMutationArgs>(
-  args: T,
-  checks: RequestIdentityChecks
+  args: T
 ): Omit<T, "operationId" | "customerId"> {
-  const { operationId, customerId, ...request } = args;
-  checks.confirm(args, "operationId", operationId);
-  checks.confirm(args, "customerId", customerId);
-  return request;
+  return copyWithout(args, new Set(["operationId", "customerId"] as const));
 }
 
 function buildRequest<Request extends object>(
@@ -395,11 +414,11 @@ function validateListEvents(request: unknown): void {
 }
 
 function readOnlyCheckRequest(
-  identifier: Identifier,
+  identity: CapturedIdentity,
   args: CheckArgsType
 ): CheckArgsType & { customerId: string } {
   return {
-    customerId: identifier.customerId,
+    customerId: identity.customerId,
     featureId: args.featureId,
     entityId: args.entityId,
     requiredBalance: args.requiredBalance,
@@ -409,13 +428,13 @@ function readOnlyCheckRequest(
 }
 
 function mergeCustomerData(
-  identifier: Identifier,
+  identity: CapturedIdentity,
   request: Omit<GetOrCreateCustomerArgsType, "operationId">
 ): Omit<GetOrCreateCustomerArgsType, "operationId"> & { customerId: string } {
   return {
-    ...identifier.customerData,
+    ...identity.source.customerData,
     ...request,
-    customerId: identifier.customerId,
+    customerId: identity.customerId,
   };
 }
 
@@ -502,7 +521,7 @@ export class Autumn<Context = unknown> {
   private async identify(
     ctx: Context,
     operation: NativeOperation
-  ): Promise<{ identifier: Identifier; checks: RequestIdentityChecks }> {
+  ): Promise<{ identity: CapturedIdentity; checks: RequestIdentityChecks }> {
     let identifier: Identifier | null;
     try {
       identifier = await this.options.identify(ctx);
@@ -516,15 +535,13 @@ export class Autumn<Context = unknown> {
       );
     }
     const checks = new RequestIdentityChecks(operation);
-    checks.capture(identifier, "customerId");
-    const customerId = identifier.customerId;
-    checks.confirm(identifier, "customerId", customerId);
+    const customerId = checks.capture(identifier, "customerId");
     if (!customerId) {
       throw new AutumnConfigurationError(
         "Autumn identify(ctx) must return a customerId."
       );
     }
-    return { identifier, checks };
+    return { identity: { source: identifier, customerId }, checks };
   }
 
   /**
@@ -535,36 +552,33 @@ export class Autumn<Context = unknown> {
    * the action and has already decided that the operation is allowed, which
    * holds whether or not that caller still had an identity of its own.
    */
-  private trustedIdentifier(
+  private trustedIdentity(
     operation: NativeOperation,
     args: InternalMutationArgs,
     checks: RequestIdentityChecks
-  ): Identifier {
-    const customerId = args.customerId;
-    checks.confirm(args, "customerId", customerId);
+  ): CapturedIdentity {
+    const customerId = checks.capture(args, "customerId");
     requireCondition(
       operation,
       customerId.length > 0,
       `${operation} requires a customerId from its caller.`
     );
-    const repeatedCustomerId = args.customerId;
-    checks.confirm(args, "customerId", repeatedCustomerId);
-    const identifier = { customerId: repeatedCustomerId };
-    checks.capture(identifier, "customerId");
-    return identifier;
+    return { source: { customerId }, customerId };
   }
 
   private async read<Operation extends NativeOperation, Result>(
     ctx: Context,
     operation: Operation,
-    request: (identifier: Identifier) => NativeRequestByOperation[Operation],
+    request: (
+      identity: CapturedIdentity
+    ) => NativeRequestByOperation[Operation],
     invoke: NativeCall<Operation, Result>,
     validate?: (
       request: NativeRequestSnapshot<NativeRequestByOperation[Operation]>
     ) => void
   ): Promise<Result> {
-    const { identifier, checks } = await this.identify(ctx, operation);
-    const nativeRequest = buildRequest(operation, () => request(identifier));
+    const { identity, checks } = await this.identify(ctx, operation);
+    const nativeRequest = buildRequest(operation, () => request(identity));
     checks.assertRequestCustomer(nativeRequest);
     checks.assertCurrent();
     const call = this.transport.createCall();
@@ -596,14 +610,9 @@ export class Autumn<Context = unknown> {
    */
   private async keyedCall(
     operation: NativeOperation,
-    identifier: Identifier,
-    args: MutationArgs,
-    checks: RequestIdentityChecks
+    customerId: string,
+    operationId: string
   ): Promise<AutumnCall> {
-    const customerId = identifier.customerId;
-    checks.confirm(identifier, "customerId", customerId);
-    const operationId = args.operationId;
-    checks.confirm(args, "operationId", operationId);
     return this.transport.createCall(
       await deriveProviderKey({
         operation,
@@ -619,22 +628,23 @@ export class Autumn<Context = unknown> {
     operation: Operation,
     args: MutationArgs,
     request: (
-      identifier: Identifier,
-      checks: RequestIdentityChecks
+      identity: CapturedIdentity
     ) => NativeRequestByOperation[Operation],
     invoke: NativeCall<Operation, Result>,
     validate?: (
       request: NativeRequestSnapshot<NativeRequestByOperation[Operation]>
     ) => void
   ): Promise<Result> {
-    const { identifier, checks } = await this.identify(ctx, operation);
-    checks.capture(args, "operationId");
-    const nativeRequest = buildRequest(operation, () =>
-      request(identifier, checks)
-    );
+    const { identity, checks } = await this.identify(ctx, operation);
+    const operationId = checks.capture(args, "operationId");
+    const nativeRequest = buildRequest(operation, () => request(identity));
     checks.assertRequestCustomer(nativeRequest);
     checks.assertCurrent();
-    const call = await this.keyedCall(operation, identifier, args, checks);
+    const call = await this.keyedCall(
+      operation,
+      identity.customerId,
+      operationId
+    );
     return await invokeNative(
       operation,
       call,
@@ -676,8 +686,7 @@ export class Autumn<Context = unknown> {
     operation: Operation,
     args: Args,
     request: (
-      identifier: Identifier,
-      checks: RequestIdentityChecks
+      identity: CapturedIdentity
     ) => NativeRequestByOperation[Operation],
     invoke: NativeCall<Operation, Result>,
     validate?: (
@@ -686,15 +695,16 @@ export class Autumn<Context = unknown> {
   ): Promise<Result> {
     try {
       const checks = new RequestIdentityChecks(operation);
-      checks.capture(args, "operationId");
-      checks.capture(args, "customerId");
-      const identifier = this.trustedIdentifier(operation, args, checks);
-      const nativeRequest = buildRequest(operation, () =>
-        request(identifier, checks)
-      );
+      const operationId = checks.capture(args, "operationId");
+      const identity = this.trustedIdentity(operation, args, checks);
+      const nativeRequest = buildRequest(operation, () => request(identity));
       checks.assertRequestCustomer(nativeRequest);
       checks.assertCurrent();
-      const call = await this.keyedCall(operation, identifier, args, checks);
+      const call = await this.keyedCall(
+        operation,
+        identity.customerId,
+        operationId
+      );
       return toConvexSerializable(
         await invokeNative(
           operation,
@@ -716,7 +726,7 @@ export class Autumn<Context = unknown> {
     return await this.read(
       ctx,
       "check",
-      (identifier) => readOnlyCheckRequest(identifier, args),
+      (identity) => readOnlyCheckRequest(identity, args),
       (request, sdk, options) => sdk.check(request, options)
     );
   }
@@ -726,9 +736,9 @@ export class Autumn<Context = unknown> {
       ctx,
       "check",
       args,
-      (identifier, checks) => ({
-        ...withoutOperationId(args, checks),
-        customerId: identifier.customerId,
+      (identity) => ({
+        ...withoutOperationId(args),
+        customerId: identity.customerId,
         sendEvent: true as const,
       }),
       (request, sdk, options) => sdk.check(request, options)
@@ -740,9 +750,9 @@ export class Autumn<Context = unknown> {
       ctx,
       "track",
       args,
-      (identifier, checks) => ({
-        ...withoutOperationId(args, checks),
-        customerId: identifier.customerId,
+      (identity) => ({
+        ...withoutOperationId(args),
+        customerId: identity.customerId,
       }),
       (request, sdk, options) => sdk.track(request, options),
       validateTrack
@@ -754,7 +764,7 @@ export class Autumn<Context = unknown> {
       return await this.read(
         ctx,
         "billing.previewAttach",
-        (identifier) => ({ ...args, customerId: identifier.customerId }),
+        (identity) => ({ ...args, customerId: identity.customerId }),
         (request, sdk, options) => sdk.billing.previewAttach(request, options),
         (request) => validateAttach("billing.previewAttach", request)
       );
@@ -764,9 +774,9 @@ export class Autumn<Context = unknown> {
         ctx,
         "billing.attach",
         args,
-        (identifier, checks) => ({
-          ...withoutOperationId(args, checks),
-          customerId: identifier.customerId,
+        (identity) => ({
+          ...withoutOperationId(args),
+          customerId: identity.customerId,
         }),
         (request, sdk, options) => sdk.billing.attach(request, options),
         (request) => validateAttach("billing.attach", request)
@@ -779,7 +789,7 @@ export class Autumn<Context = unknown> {
       return await this.read(
         ctx,
         "billing.previewMultiAttach",
-        (identifier) => ({ ...args, customerId: identifier.customerId }),
+        (identity) => ({ ...args, customerId: identity.customerId }),
         (request, sdk, options) =>
           sdk.billing.previewMultiAttach(request, options),
         (request) => validateMultiAttach("billing.previewMultiAttach", request)
@@ -790,9 +800,9 @@ export class Autumn<Context = unknown> {
         ctx,
         "billing.multiAttach",
         args,
-        (identifier, checks) => ({
-          ...withoutOperationId(args, checks),
-          customerId: identifier.customerId,
+        (identity) => ({
+          ...withoutOperationId(args),
+          customerId: identity.customerId,
         }),
         (request, sdk, options) => sdk.billing.multiAttach(request, options),
         (request) => validateMultiAttach("billing.multiAttach", request)
@@ -802,7 +812,7 @@ export class Autumn<Context = unknown> {
       return await this.read(
         ctx,
         "billing.previewUpdate",
-        (identifier) => ({ ...args, customerId: identifier.customerId }),
+        (identity) => ({ ...args, customerId: identity.customerId }),
         (request, sdk, options) => sdk.billing.previewUpdate(request, options),
         (request) => validateAttach("billing.previewUpdate", request)
       );
@@ -812,9 +822,9 @@ export class Autumn<Context = unknown> {
         ctx,
         "billing.update",
         args,
-        (identifier, checks) => ({
-          ...withoutOperationId(args, checks),
-          customerId: identifier.customerId,
+        (identity) => ({
+          ...withoutOperationId(args),
+          customerId: identity.customerId,
         }),
         (request, sdk, options) => sdk.billing.update(request, options),
         (request) => validateAttach("billing.update", request)
@@ -827,7 +837,7 @@ export class Autumn<Context = unknown> {
       return await this.read(
         ctx,
         "billing.previewMultiUpdate",
-        (identifier) => ({ ...args, customerId: identifier.customerId }),
+        (identity) => ({ ...args, customerId: identity.customerId }),
         (request, sdk, options) =>
           sdk.billing.previewMultiUpdate(request, options),
         (request) => validateMultiUpdate("billing.previewMultiUpdate", request)
@@ -838,9 +848,9 @@ export class Autumn<Context = unknown> {
         ctx,
         "billing.multiUpdate",
         args,
-        (identifier, checks) => ({
-          ...withoutOperationId(args, checks),
-          customerId: identifier.customerId,
+        (identity) => ({
+          ...withoutOperationId(args),
+          customerId: identity.customerId,
         }),
         (request, sdk, options) => sdk.billing.multiUpdate(request, options),
         (request) => validateMultiUpdate("billing.multiUpdate", request)
@@ -851,9 +861,9 @@ export class Autumn<Context = unknown> {
         ctx,
         "billing.setupPayment",
         args,
-        (identifier, checks) => ({
-          ...withoutOperationId(args, checks),
-          customerId: identifier.customerId,
+        (identity) => ({
+          ...withoutOperationId(args),
+          customerId: identity.customerId,
         }),
         (request, sdk, options) => sdk.billing.setupPayment(request, options),
         (request) => validateAttach("billing.setupPayment", request)
@@ -863,7 +873,7 @@ export class Autumn<Context = unknown> {
       await this.read(
         ctx,
         "billing.portal",
-        (identifier) => ({ ...args, customerId: identifier.customerId }),
+        (identity) => ({ ...args, customerId: identity.customerId }),
         (request, sdk, options) =>
           sdk.billing.openCustomerPortal(request, options)
       ),
@@ -874,7 +884,7 @@ export class Autumn<Context = unknown> {
       await this.read(
         ctx,
         "customers.get",
-        (identifier) => ({ ...args, customerId: identifier.customerId }),
+        (identity) => ({ ...args, customerId: identity.customerId }),
         (request, sdk, options) => sdk.customers.get(request, options)
       ),
     getOrCreate: async (ctx: Context, args: GetOrCreateCustomerArgsType) =>
@@ -882,8 +892,7 @@ export class Autumn<Context = unknown> {
         ctx,
         "customers.getOrCreate",
         args,
-        (identifier, checks) =>
-          mergeCustomerData(identifier, withoutOperationId(args, checks)),
+        (identity) => mergeCustomerData(identity, withoutOperationId(args)),
         (request, sdk, options) => sdk.customers.getOrCreate(request, options)
       ),
     update: async (ctx: Context, args: UpdateCustomerArgsType) =>
@@ -891,9 +900,9 @@ export class Autumn<Context = unknown> {
         ctx,
         "customers.update",
         args,
-        (identifier, checks) => ({
-          ...withoutOperationId(args, checks),
-          customerId: identifier.customerId,
+        (identity) => ({
+          ...withoutOperationId(args),
+          customerId: identity.customerId,
         }),
         (request, sdk, options) => sdk.customers.update(request, options)
       ),
@@ -902,9 +911,9 @@ export class Autumn<Context = unknown> {
         ctx,
         "customers.delete",
         args,
-        (identifier, checks) => ({
-          ...withoutOperationId(args, checks),
-          customerId: identifier.customerId,
+        (identity) => ({
+          ...withoutOperationId(args),
+          customerId: identity.customerId,
         }),
         (request, sdk, options) => sdk.customers.delete(request, options)
       ),
@@ -916,9 +925,9 @@ export class Autumn<Context = unknown> {
         ctx,
         "entities.create",
         args,
-        (identifier, checks) => ({
-          ...withoutOperationId(args, checks),
-          customerId: identifier.customerId,
+        (identity) => ({
+          ...withoutOperationId(args),
+          customerId: identity.customerId,
         }),
         (request, sdk, options) => sdk.entities.create(request, options)
       ),
@@ -926,14 +935,14 @@ export class Autumn<Context = unknown> {
       await this.read(
         ctx,
         "entities.get",
-        (identifier) => ({ ...args, customerId: identifier.customerId }),
+        (identity) => ({ ...args, customerId: identity.customerId }),
         (request, sdk, options) => sdk.entities.get(request, options)
       ),
     list: async (ctx: Context, args: ListEntitiesArgsType = {}) =>
       await this.read(
         ctx,
         "entities.list",
-        (identifier) => ({ ...args, customerId: identifier.customerId }),
+        (identity) => ({ ...args, customerId: identity.customerId }),
         (request, sdk, options) => sdk.entities.list(request, options)
       ),
     update: async (ctx: Context, args: UpdateEntityArgsType) =>
@@ -941,9 +950,9 @@ export class Autumn<Context = unknown> {
         ctx,
         "entities.update",
         args,
-        (identifier, checks) => ({
-          ...withoutOperationId(args, checks),
-          customerId: identifier.customerId,
+        (identity) => ({
+          ...withoutOperationId(args),
+          customerId: identity.customerId,
         }),
         (request, sdk, options) => sdk.entities.update(request, options)
       ),
@@ -952,9 +961,9 @@ export class Autumn<Context = unknown> {
         ctx,
         "entities.delete",
         args,
-        (identifier, checks) => ({
-          ...withoutOperationId(args, checks),
-          customerId: identifier.customerId,
+        (identity) => ({
+          ...withoutOperationId(args),
+          customerId: identity.customerId,
         }),
         (request, sdk, options) => sdk.entities.delete(request, options)
       ),
@@ -974,7 +983,7 @@ export class Autumn<Context = unknown> {
       await this.read(
         ctx,
         "plans.list",
-        (identifier) => ({ ...args, customerId: identifier.customerId }),
+        (identity) => ({ ...args, customerId: identity.customerId }),
         (request, sdk, options) => sdk.plans.list(request, options)
       ),
   };
@@ -985,9 +994,9 @@ export class Autumn<Context = unknown> {
         ctx,
         "balances.update",
         args,
-        (identifier, checks) => ({
-          ...withoutOperationId(args, checks),
-          customerId: identifier.customerId,
+        (identity) => ({
+          ...withoutOperationId(args),
+          customerId: identity.customerId,
         }),
         (request, sdk, options) => sdk.balances.update(request, options),
         validateBalance
@@ -1000,7 +1009,7 @@ export class Autumn<Context = unknown> {
       return await this.read(
         ctx,
         "events.list",
-        (identifier) => ({ ...args, customerId: identifier.customerId }),
+        (identity) => ({ ...args, customerId: identity.customerId }),
         (request, sdk, options) => sdk.events.list(request, options),
         validateListEvents
       );
@@ -1009,7 +1018,7 @@ export class Autumn<Context = unknown> {
       return await this.read(
         ctx,
         "events.aggregate",
-        (identifier) => ({ ...args, customerId: identifier.customerId }),
+        (identity) => ({ ...args, customerId: identity.customerId }),
         (request, sdk, options) => sdk.events.aggregate(request, options),
         validateAggregateEvents
       );
@@ -1022,9 +1031,9 @@ export class Autumn<Context = unknown> {
         ctx,
         "referrals.create",
         args,
-        (identifier, checks) => ({
-          ...withoutOperationId(args, checks),
-          customerId: identifier.customerId,
+        (identity) => ({
+          ...withoutOperationId(args),
+          customerId: identity.customerId,
         }),
         (request, sdk, options) => sdk.referrals.createCode(request, options)
       ),
@@ -1033,9 +1042,9 @@ export class Autumn<Context = unknown> {
         ctx,
         "referrals.redeem",
         args,
-        (identifier, checks) => ({
-          ...withoutOperationId(args, checks),
-          customerId: identifier.customerId,
+        (identity) => ({
+          ...withoutOperationId(args),
+          customerId: identity.customerId,
         }),
         (request, sdk, options) => sdk.referrals.redeemCode(request, options)
       ),
@@ -1188,9 +1197,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "check",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
               sendEvent: true as const,
             }),
             (request, sdk, options) => sdk.check(request, options)
@@ -1202,9 +1211,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "track",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
             }),
             (request, sdk, options) => sdk.track(request, options),
             validateTrack
@@ -1216,9 +1225,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "billing.attach",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
             }),
             (request, sdk, options) => sdk.billing.attach(request, options),
             (args) => validateAttach("billing.attach", args)
@@ -1230,9 +1239,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "billing.multiAttach",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
             }),
             (request, sdk, options) =>
               sdk.billing.multiAttach(request, options),
@@ -1245,9 +1254,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "billing.update",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
             }),
             (request, sdk, options) => sdk.billing.update(request, options),
             (args) =>
@@ -1263,9 +1272,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "billing.multiUpdate",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
             }),
             (request, sdk, options) =>
               sdk.billing.multiUpdate(request, options),
@@ -1278,9 +1287,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "billing.setupPayment",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
             }),
             (request, sdk, options) =>
               sdk.billing.setupPayment(request, options),
@@ -1297,8 +1306,7 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "customers.getOrCreate",
             args,
-            (identifier, checks) =>
-              mergeCustomerData(identifier, withoutIdentity(args, checks)),
+            (identity) => mergeCustomerData(identity, withoutIdentity(args)),
             (request, sdk, options) =>
               sdk.customers.getOrCreate(request, options)
           ),
@@ -1309,9 +1317,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "customers.update",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
             }),
             (request, sdk, options) => sdk.customers.update(request, options)
           ),
@@ -1322,9 +1330,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "customers.delete",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
             }),
             (request, sdk, options) => sdk.customers.delete(request, options)
           ),
@@ -1335,9 +1343,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "entities.create",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
             }),
             (request, sdk, options) => sdk.entities.create(request, options)
           ),
@@ -1348,9 +1356,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "entities.update",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
             }),
             (request, sdk, options) => sdk.entities.update(request, options)
           ),
@@ -1361,9 +1369,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "entities.delete",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
             }),
             (request, sdk, options) => sdk.entities.delete(request, options)
           ),
@@ -1374,9 +1382,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "balances.update",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
             }),
             (request, sdk, options) => sdk.balances.update(request, options),
             validateBalance
@@ -1388,9 +1396,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "referrals.create",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
             }),
             (request, sdk, options) =>
               sdk.referrals.createCode(request, options)
@@ -1402,9 +1410,9 @@ export class Autumn<Context = unknown> {
           await this.generated(
             "referrals.redeem",
             args,
-            (identifier, checks) => ({
-              ...withoutIdentity(args, checks),
-              customerId: identifier.customerId,
+            (identity) => ({
+              ...withoutIdentity(args),
+              customerId: identity.customerId,
             }),
             (request, sdk, options) =>
               sdk.referrals.redeemCode(request, options)

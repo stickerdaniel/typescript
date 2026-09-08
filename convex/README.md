@@ -417,10 +417,11 @@ The constructor requires `operationNamespace` and `identify`, and accepts
 overrides are rejected case-insensitively.
 
 Set `timeoutMs` explicitly. Without it, `check`, `consumeCheck` and `track` have
-the SDK's own five-second timeout (autumn-js 1.2.55); every other operation waits
-indefinitely. This is
-especially important for `consumeCheck`, because Autumn may have recorded the
-usage event before the request aborts. If a call outlives Convex's action
+the SDK's own five-second timeout (autumn-js 1.2.55); `consumeCheck` inherits it
+because the package invokes the SDK's `check` operation. Every other operation
+waits indefinitely. This is especially important for `consumeCheck`, because
+Autumn may have recorded the usage event before the request aborts. If a call
+outlives Convex's action
 execution limit, the platform reports its failure instead of an
 `AUTUMN_INDETERMINATE` error.
 

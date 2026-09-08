@@ -1,9 +1,12 @@
 "use node";
 // @vitest-environment node
 
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { EdgeVM } from "@edge-runtime/vm";
 import { Autumn as AutumnSDK, HTTPClient } from "autumn-js";
 import { describe, expect, test, vi } from "vitest";
 import { Autumn, AutumnValidationError } from "./client/index.js";
@@ -50,6 +53,36 @@ function client(fetcher: typeof fetch) {
   });
 }
 
+function changingPrototypeBytes() {
+  let prototypeReads = 0;
+  const bytes = new Proxy(new Uint8Array([1, 2, 3]), {
+    getPrototypeOf() {
+      prototypeReads += 1;
+      return prototypeReads === 1 ? Uint8Array.prototype : Object.prototype;
+    },
+  });
+  return { bytes, prototypeReads: () => prototypeReads };
+}
+
+function sdkChangingPrototypeBytes() {
+  const fixture = fileURLToPath(
+    new URL("./request-unhandled.fixture.mjs", import.meta.url)
+  );
+  const result = spawnSync(process.execPath, [fixture, "typed-array-proxy"], {
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  expect(result.status, result.stderr).toBe(0);
+  return JSON.parse(result.stdout) as {
+    callerRejected: boolean;
+    callerName: string;
+    fetchCount: number;
+    prototypeReads: number;
+    unhandledCount: number;
+    unhandledName: string;
+  };
+}
+
 async function packageTrack(properties: Record<string, unknown>) {
   const requests: Request[] = [];
   const fetcher = vi.fn(async (input: RequestInfo | URL) => {
@@ -89,15 +122,117 @@ async function sdkTrack(properties: Record<string, unknown>) {
   return { caught, fetcher, requests };
 }
 
+async function packageUpdate(featureQuantities: unknown[]) {
+  const fetcher = vi.fn(async () => rejected());
+  const caught = await client(fetcher)
+    .billing.update(null, {
+      planId: "pro",
+      featureQuantities,
+      operationId: "package-update",
+    } as never)
+    .catch((error: unknown) => error);
+  return { caught, fetcher };
+}
+
+async function sdkUpdate(featureQuantities: unknown[]) {
+  const fetcher = vi.fn(async () => rejected());
+  const sdk = new AutumnSDK({
+    secretKey: "test-secret-key",
+    serverURL: "https://example.test",
+    failOpen: false,
+    retryConfig: { strategy: "none" },
+    debugLogger: SILENT_LOGGER,
+    httpClient: new HTTPClient({ fetcher }),
+  });
+  const caught = await sdk.billing
+    .update(
+      {
+        customerId: CUSTOMER_ID,
+        planId: "pro",
+        featureQuantities,
+      } as never,
+      { retries: { strategy: "none" } }
+    )
+    .catch((error: unknown) => error);
+  return { caught, fetcher };
+}
+
 describe("installed SDK request contracts", () => {
-  test("resolves autumn-js 1.2.55 with Zod 4.1.5 from the SDK", () => {
+  test("resolves the installed request contract dependencies", () => {
     const rootRequire = createRequire(import.meta.url);
     const sdkEntry = rootRequire.resolve("autumn-js");
     const sdkRequire = createRequire(sdkEntry);
     const zodEntry = sdkRequire.resolve("zod");
+    const edgeRuntimeEntry = rootRequire.resolve("@edge-runtime/vm");
 
     expect(packageVersion(sdkEntry, "autumn-js")).toBe("1.2.55");
     expect(packageVersion(zodEntry, "zod")).toBe("4.1.5");
+    expect(packageVersion(edgeRuntimeEntry, "@edge-runtime/vm")).toBe("5.0.0");
+  });
+
+  test("matches the SDK rejection for a noncanonical array length", async () => {
+    const featureQuantities = new Proxy(
+      [
+        { featureId: "seats", quantity: 1 },
+        { featureId: "messages", quantity: 2 },
+      ],
+      {
+        get(target, key, receiver) {
+          if (key === "length") return 1.5;
+          return Reflect.get(target, key, receiver);
+        },
+      }
+    );
+
+    const native = await sdkUpdate(featureQuantities);
+    const packaged = await packageUpdate(featureQuantities);
+
+    expect(native.caught).toMatchObject({ name: "SDKValidationError" });
+    expect(packaged.caught).toBeInstanceOf(AutumnValidationError);
+    expect(native.fetcher).not.toHaveBeenCalled();
+    expect(packaged.fetcher).not.toHaveBeenCalled();
+  });
+
+  test("matches the SDK rejection for a changing byte prototype", async () => {
+    const native = sdkChangingPrototypeBytes();
+    const changing = changingPrototypeBytes();
+    const packaged = await packageTrack({ bytes: changing.bytes });
+
+    expect(native).toEqual({
+      callerRejected: true,
+      callerName: "TypeError",
+      fetchCount: 0,
+      prototypeReads: 1,
+      unhandledCount: 1,
+      unhandledName: "TypeError",
+    });
+    expect(packaged.caught).toBeInstanceOf(AutumnValidationError);
+    expect(packaged.fetcher).not.toHaveBeenCalled();
+    expect(changing.prototypeReads()).toBe(1);
+  });
+
+  test("matches the SDK body for Edge Runtime encoded bytes", async () => {
+    const edge = new EdgeVM();
+    const bytes = edge.evaluate<Uint8Array>(
+      'new TextEncoder().encode("value")'
+    );
+    Object.defineProperty(edge.context, "bytes", { value: bytes });
+    expect(edge.evaluate("bytes instanceof Uint8Array")).toBe(true);
+    expect(
+      edge.evaluate("Object.getPrototypeOf(bytes) === Uint8Array.prototype")
+    ).toBe(false);
+
+    const native = await sdkTrack({ bytes });
+    const packaged = await packageTrack({ bytes });
+
+    expect(native.fetcher).toHaveBeenCalledOnce();
+    expect(packaged.fetcher).toHaveBeenCalledOnce();
+    const nativeBody = await native.requests[0]!.text();
+    const packagedBody = await packaged.requests[0]!.text();
+    expect(packagedBody).toBe(nativeBody);
+    expect(JSON.parse(packagedBody)).toMatchObject({
+      properties: { bytes: "dmFsdWU=" },
+    });
   });
 
   test("rejects a symbol key on a free SDK record without fetching", async () => {

@@ -9,7 +9,6 @@ import {
   expect,
   test,
 } from "vitest";
-import { setTimeout as delay } from "node:timers/promises";
 import { AutumnError, UnexpectedClientError } from "autumn-js";
 import { defineSchema, makeFunctionReference } from "convex/server";
 import type { InternalTrackArgs } from "../types.js";
@@ -62,14 +61,14 @@ beforeEach(() => {
  * The SDK hands its result to a promise it also unwraps a second time, and an
  * error that escapes the guarded fetcher path rejects that second promise with
  * nothing attached to it, which ends a Node 24 process even where the action
- * error is caught. Node reports such a rejection a turn after the promise
- * settles, so this leaves the current turn before it looks.
+ * error is caught. Node reports such a rejection after the promise settles, so
+ * this flushes the event loop before it looks.
  *
  * Every test calls this before it inspects the error data, because an assertion
  * on the data would otherwise fail first and hide the rejection.
  */
 async function expectNoUnhandledRejections(): Promise<void> {
-  await delay(20);
+  await new Promise(setImmediate);
   expect(
     rejections.map((reason) =>
       reason instanceof Error ? `${reason.name}: ${reason.message}` : reason

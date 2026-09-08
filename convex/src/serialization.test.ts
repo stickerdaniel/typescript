@@ -1,3 +1,4 @@
+import { EdgeVM } from "@edge-runtime/vm";
 import { describe, expect, test, vi } from "vitest";
 import { convexToJson, type Value } from "convex/values";
 import { AutumnValidationError } from "./errors.js";
@@ -213,6 +214,47 @@ describe("Autumn request snapshots", () => {
     expect(Object.is(snapshot.properties!.negativeZero, -0)).toBe(false);
   });
 
+  test.each(["2", Number.POSITIVE_INFINITY, 1.5, -1, 2 ** 32])(
+    "rejects the noncanonical array length %s",
+    (length) => {
+      const values = new Proxy([1, 2], {
+        get(target, key, receiver) {
+          if (key === "length") return length;
+          return Reflect.get(target, key, receiver);
+        },
+        getOwnPropertyDescriptor(target, key) {
+          if (key === "length") {
+            return {
+              configurable: false,
+              enumerable: false,
+              writable: true,
+              value: length,
+            };
+          }
+          return Reflect.getOwnPropertyDescriptor(target, key);
+        },
+      });
+
+      expect(invalidTrack(values)).toThrow(AutumnValidationError);
+    }
+  );
+
+  test("rejects an array whose length changes while it is materialized", () => {
+    let reads = 0;
+    const values = new Proxy([1, 2], {
+      get(target, key, receiver) {
+        if (key === "length") {
+          reads += 1;
+          return reads === 1 ? 2 : 1.5;
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+
+    expect(invalidTrack(values)).toThrow(AutumnValidationError);
+    expect(reads).toBe(2);
+  });
+
   test.each([
     ["bigint", 1n],
     ["NaN", Number.NaN],
@@ -252,10 +294,48 @@ describe("Autumn request snapshots", () => {
     expect(invalidTrack(value)).toThrow(AutumnValidationError);
   });
 
+  test("rejects a Proxy around Uint8Array", () => {
+    const bytes = new Proxy(new Uint8Array([1, 2, 3]), {});
+
+    expect(invalidTrack(bytes)).toThrow(AutumnValidationError);
+  });
+
+  test("keeps a byte Proxy on the object path when its first prototype is plain", () => {
+    const bytes = new Proxy(new Uint8Array([1, 2, 3]), {
+      getPrototypeOf() {
+        return Object.prototype;
+      },
+    });
+
+    expect(snapshotTrack({ bytes }).properties).toEqual({
+      bytes: { 0: 1, 1: 2, 2: 3 },
+    });
+  });
+
   test("rejects Uint8Array backed by shared memory", () => {
     const bytes = new Uint8Array(new SharedArrayBuffer(4));
 
     expect(invalidTrack(bytes)).toThrow(AutumnValidationError);
+  });
+
+  test("accepts direct Uint8Array values from an Edge Runtime realm", () => {
+    const edge = new EdgeVM();
+    const encoded = edge.evaluate<Uint8Array>(
+      'new TextEncoder().encode("value")'
+    );
+    Object.defineProperty(edge.context, "encoded", { value: encoded });
+    expect(edge.evaluate("encoded instanceof Uint8Array")).toBe(true);
+    expect(
+      edge.evaluate("Object.getPrototypeOf(encoded) === Uint8Array.prototype")
+    ).toBe(false);
+
+    const foreignBytes = edge.evaluate<Uint8Array>(
+      "new Uint8Array([118, 97, 108, 117, 101])"
+    );
+    expect(Object.getPrototypeOf(foreignBytes)).not.toBe(Uint8Array.prototype);
+    expect(snapshotTrack({ bytes: foreignBytes }).properties).toEqual({
+      bytes: "dmFsdWU=",
+    });
   });
 
   test("normalizes Date and Uint8Array only below registered free records", () => {

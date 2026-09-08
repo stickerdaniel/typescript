@@ -134,7 +134,9 @@ function isAmbiguousStatus(statusCode: number): boolean {
  * catches it: the observed status is lost, and the SDK's secondary result promise
  * rejects with no handler attached. Reading a clone keeps that failure inside the
  * guarded fetcher path for every status and leaves the original body for the SDK.
- * Only a success body has to be JSON, because no result is decoded from a failure
+ * Successful JSON is intentionally parsed twice because autumn-js does not accept
+ * a preparsed body; without this first parse, its own parse failure also rejects
+ * the secondary promise without a handler. No result is decoded from a failure
  * body.
  */
 async function requireReadableBody(response: Response): Promise<void> {

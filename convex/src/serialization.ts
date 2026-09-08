@@ -11,6 +11,20 @@ const REQUEST_VALIDATION_MESSAGE =
   "The Autumn request contains a value Autumn cannot receive faithfully.";
 const BASE64_ALPHABET =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const MAX_ARRAY_LENGTH = 2 ** 32 - 1;
+const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype);
+const TYPED_ARRAY_BUFFER_GETTER = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "buffer"
+)?.get;
+const TYPED_ARRAY_LENGTH_GETTER = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "length"
+)?.get;
+const TYPED_ARRAY_TAG_GETTER = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  Symbol.toStringTag
+)?.get;
 
 type IsAny<T> = 0 extends 1 & T ? true : false;
 type RootKey<Operation extends NativeOperation> = Extract<
@@ -133,15 +147,119 @@ function defineDataProperty(
   });
 }
 
-function copyUint8Array(source: Uint8Array): Uint8Array {
-  const lengthGetter = Object.getOwnPropertyDescriptor(
-    Object.getPrototypeOf(Uint8Array.prototype),
-    "length"
-  )?.get;
-  if (!lengthGetter) throw new TypeError();
-  const copy = new Uint8Array(lengthGetter.call(source) as number);
+function copyUint8Array(source: Uint8Array, length: number): Uint8Array {
+  const copy = new Uint8Array(length);
   Uint8Array.prototype.set.call(copy, source);
   return copy;
+}
+
+function canonicalArrayLength(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value <= MAX_ARRAY_LENGTH
+  );
+}
+
+function captureArrayLength(source: unknown[]): number {
+  const descriptor = Reflect.getOwnPropertyDescriptor(source, "length");
+  if (
+    !descriptor ||
+    !("value" in descriptor) ||
+    !canonicalArrayLength(descriptor.value)
+  ) {
+    throw new TypeError();
+  }
+  const length = Reflect.get(source, "length");
+  if (length !== descriptor.value) throw new TypeError();
+  return length;
+}
+
+function confirmArrayLength(source: unknown[], length: number): void {
+  const descriptor = Reflect.getOwnPropertyDescriptor(source, "length");
+  if (!descriptor || !("value" in descriptor) || descriptor.value !== length) {
+    throw new TypeError();
+  }
+  if (Reflect.get(source, "length") !== length) throw new TypeError();
+}
+
+function directTypedArrayBytesPerElement(
+  prototype: object | null
+): number | undefined {
+  if (!prototype) return undefined;
+  const bytesPerElement = Reflect.getOwnPropertyDescriptor(
+    prototype,
+    "BYTES_PER_ELEMENT"
+  );
+  if (
+    !bytesPerElement ||
+    !("value" in bytesPerElement) ||
+    typeof bytesPerElement.value !== "number" ||
+    bytesPerElement.writable ||
+    bytesPerElement.enumerable ||
+    bytesPerElement.configurable
+  ) {
+    return undefined;
+  }
+
+  const typedArrayPrototype = Object.getPrototypeOf(prototype);
+  if (!typedArrayPrototype) return undefined;
+  const buffer = Reflect.getOwnPropertyDescriptor(
+    typedArrayPrototype,
+    "buffer"
+  );
+  const length = Reflect.getOwnPropertyDescriptor(
+    typedArrayPrototype,
+    "length"
+  );
+  const tag = Reflect.getOwnPropertyDescriptor(
+    typedArrayPrototype,
+    Symbol.toStringTag
+  );
+  if (
+    typeof buffer?.get !== "function" ||
+    typeof length?.get !== "function" ||
+    typeof tag?.get !== "function"
+  ) {
+    return undefined;
+  }
+  return bytesPerElement.value;
+}
+
+function hasTypedArrayPrototypeShape(prototype: object | null): boolean {
+  if (directTypedArrayBytesPerElement(prototype) !== undefined) return true;
+  return (
+    prototype !== null &&
+    directTypedArrayBytesPerElement(Object.getPrototypeOf(prototype)) !==
+      undefined
+  );
+}
+
+function readUint8Array(
+  source: object,
+  prototype: object | null
+): { buffer: ArrayBufferLike; length: number } | undefined {
+  if (
+    !TYPED_ARRAY_BUFFER_GETTER ||
+    !TYPED_ARRAY_LENGTH_GETTER ||
+    !TYPED_ARRAY_TAG_GETTER
+  ) {
+    throw new TypeError();
+  }
+
+  const tag = TYPED_ARRAY_TAG_GETTER.call(source) as unknown;
+  if (tag !== "Uint8Array") {
+    if (hasTypedArrayPrototypeShape(prototype)) throw new TypeError();
+    return undefined;
+  }
+  if (directTypedArrayBytesPerElement(prototype) !== 1) throw new TypeError();
+
+  return {
+    buffer: TYPED_ARRAY_BUFFER_GETTER.call(source) as ArrayBufferLike,
+    length: TYPED_ARRAY_LENGTH_GETTER.call(source) as number,
+  };
 }
 
 function base64(bytes: Uint8Array): string {
@@ -226,7 +344,7 @@ function materialize(operation: NativeOperation, request: object): JsonValue {
       throw new TypeError();
 
     const result: JsonValue[] = [];
-    const length = source.length;
+    const length = captureArrayLength(source);
     for (let index = 0; index < length; index += 1) {
       if (!Object.prototype.hasOwnProperty.call(source, index)) {
         result.push(null);
@@ -235,6 +353,7 @@ function materialize(operation: NativeOperation, request: object): JsonValue {
       const value = visit(Reflect.get(source, index), domain);
       result.push(value === undefined ? null : value);
     }
+    confirmArrayLength(source, length);
     return complete(source, domain, result) as JsonValue[];
   }
 
@@ -335,18 +454,13 @@ function materialize(operation: NativeOperation, request: object): JsonValue {
       if (!Number.isFinite(time)) throw new TypeError();
       return complete(source, domain, new Date(time).toISOString());
     }
-    if (prototype === Uint8Array.prototype) {
+    const uint8Array = readUint8Array(source, prototype);
+    if (uint8Array) {
       const previous = begin(source, domain);
       if (previous !== undefined) return previous;
       if (domain !== "freeValue") throw new TypeError();
-      const bufferGetter = Object.getOwnPropertyDescriptor(
-        Object.getPrototypeOf(Uint8Array.prototype),
-        "buffer"
-      )?.get;
-      if (!bufferGetter) throw new TypeError();
-      const buffer = bufferGetter.call(source);
-      if (isSharedArrayBuffer(buffer)) throw new TypeError();
-      const copy = copyUint8Array(source as Uint8Array);
+      if (isSharedArrayBuffer(uint8Array.buffer)) throw new TypeError();
+      const copy = copyUint8Array(source as Uint8Array, uint8Array.length);
       return complete(source, domain, base64(copy));
     }
     if (Array.isArray(source)) return visitArray(source, domain);
