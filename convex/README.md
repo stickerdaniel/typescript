@@ -327,15 +327,21 @@ above. Direct billing methods accept the complete supported SDK subset. The
 generated public actions omit billing operator controls and portal session
 creation.
 
-Every composed native request is materialized once before package validation or
-the SDK can read it. The resulting snapshot contains only package-owned JSON
-data. Arrays, objects, getters and proxies are observed during that one pass;
-subsequent caller mutations cannot change the request sent to Autumn. Array
-holes and array entries containing `undefined` become `null`, while object fields
-containing `undefined` are omitted. Cycles, classes, boxed primitives, functions,
-symbol values, `bigint`, non-finite numbers, `ArrayBuffer`, `DataView`, typed
-arrays other than the explicitly supported `Uint8Array`, and other native
-objects are rejected locally without a provider request.
+Every composed native request is materialized once after identity checks and
+request construction, before package payload validation or the SDK can read it.
+The resulting snapshot contains only package-owned JSON data. Arrays, objects,
+getters and proxies are observed during that one pass; subsequent caller
+mutations cannot change the request sent to Autumn. This is a controlled,
+non-atomic observation of payload data. A stateful payload proxy can influence
+the plain-data form observed during materialization, and the package does not
+promise the same accept-or-reject result as passing that original proxy directly
+to `autumn-js`. A trap error encountered during materialization still fails
+locally. Array holes and array entries containing `undefined` become `null`,
+while object fields containing `undefined` are omitted. Stable inputs containing
+cycles, classes, boxed primitives, functions, symbol values, `bigint`, non-finite
+numbers, `ArrayBuffer`, `DataView`, typed arrays other than the explicitly
+supported `Uint8Array`, and other native objects are rejected locally without a
+provider request.
 
 `Date` and `Uint8Array` are normalized only as values of the supported root
 free-value records: `properties` for check and track, `checkoutSessionParams`

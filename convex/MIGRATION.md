@@ -96,12 +96,17 @@ limits.
 
 ## Request snapshots
 
-Direct-method requests are now detached from caller-owned data before any
-package rule or SDK schema reads them. Payload getters run once during that
-materialization, and later mutations to caller objects, arrays, dates or bytes
-cannot change the provider body. A rejected snapshot makes no provider request.
+After identity checks and native request construction, requests are detached
+from caller-owned data before package payload rules or SDK schemas read them.
+Selected payload getters run once during that materialization, and later
+mutations to caller objects, arrays, dates or bytes cannot change the provider
+body. Payload proxy observation is controlled but non-atomic: the values and
+plain-data form successfully observed during materialization define the
+snapshot. The package does not promise the same accept-or-reject result as
+passing an original stateful proxy directly to `autumn-js`. A trap error or
+rejected snapshot still makes no provider request.
 
-The compatibility boundary is deliberately closed:
+The compatibility boundary is deliberately closed for stable inputs:
 
 - `Date` and `Uint8Array` normalize only in supported root free-value records:
   check and track `properties`, attach and setup-payment
@@ -120,9 +125,10 @@ The compatibility boundary is deliberately closed:
   properties. Accessors, inherited fields, contradictory proxy reads and
   mid-request changes are rejected without selecting another idempotency key.
 
-Review direct-method callers that supplied custom classes, non-enumerable fields
-outside an SDK record, or reused one object across fields with different request
-semantics. Convert those values to plain JSON data before calling this package.
+Review direct-method callers that supplied custom classes, stateful payload
+proxies, non-enumerable fields outside an SDK record, or reused one object across
+fields with different request semantics. Convert those values to stable plain
+JSON data before calling this package.
 
 ## Method mapping
 
