@@ -291,11 +291,7 @@ describe("Autumn native transport", () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  test("preserves supported native direct-method values", async () => {
-    class PropertyValue {
-      x = 1;
-    }
-
+  test("snapshots supported native direct-method values", async () => {
     const at = new Date("2026-01-01T00:00:00.000Z");
     const blob = new Uint8Array(100_000);
     blob.set([1, 2, 3]);
@@ -306,7 +302,7 @@ describe("Autumn native transport", () => {
     const request = await capture((autumn) =>
       autumn.track(null, {
         featureId: "messages",
-        properties: { at, blob, delta, object: new PropertyValue() },
+        properties: { at, blob, delta, object: { x: 1 } },
         operationId: "native-values",
       })
     );
@@ -1194,6 +1190,218 @@ describe("Autumn native transport", () => {
     const fetcher = vi.fn();
 
     await expect(execute(client(fetcher))).rejects.toThrow(message);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test("rejects an operationId accessor without reading or fetching", async () => {
+    const fetcher = vi.fn();
+    let reads = 0;
+    const args = {
+      featureId: "messages",
+      get operationId() {
+        reads += 1;
+        return reads === 1 ? "first" : "second";
+      },
+    };
+
+    await expect(client(fetcher).track(null, args)).rejects.toThrow(
+      "stable primitive string properties"
+    );
+    expect(reads).toBe(0);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test("rejects a customerId accessor without reading or fetching", async () => {
+    const fetcher = vi.fn();
+    let reads = 0;
+    const autumn = new Autumn({} as never, {
+      secretKey: "test-secret-key",
+      serverURL: "https://example.test",
+      operationNamespace: "namespace-1",
+      identify: async () => ({
+        get customerId() {
+          reads += 1;
+          return reads === 1 ? "first" : "second";
+        },
+      }),
+      fetcher,
+    });
+
+    await expect(
+      autumn.track(null, { featureId: "messages", operationId: "operation" })
+    ).rejects.toThrow("stable primitive string properties");
+    expect(reads).toBe(0);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test("rejects a proxy whose data descriptor and read disagree", async () => {
+    const fetcher = vi.fn();
+    const target = { featureId: "messages", operationId: "descriptor-value" };
+    const args = new Proxy(target, {
+      get(source, key, receiver) {
+        if (key === "operationId") return "read-value";
+        return Reflect.get(source, key, receiver);
+      },
+    });
+
+    await expect(client(fetcher).track(null, args)).rejects.toThrow(
+      "stable primitive string properties"
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test("rejects metadata changed while the request is built", async () => {
+    const fetcher = vi.fn();
+    const args = {
+      featureId: "messages",
+      operationId: "before",
+      get payloadMutation() {
+        Object.defineProperty(this, "operationId", {
+          enumerable: true,
+          configurable: true,
+          writable: true,
+          value: "after",
+        });
+        return "changed";
+      },
+    };
+
+    await expect(client(fetcher).track(null, args)).rejects.toThrow(
+      "stable primitive string properties"
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test("rejects metadata changed while the request is materialized", async () => {
+    const fetcher = vi.fn();
+    const args = {
+      featureId: "messages",
+      operationId: "before",
+      properties: {
+        get mutation() {
+          args.operationId = "after";
+          return "changed";
+        },
+      },
+    };
+
+    await expect(client(fetcher).track(null, args)).rejects.toThrow(
+      "stable primitive string properties"
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test("keeps request construction before keyed identity reads", async () => {
+    const reads: string[] = [];
+    const fetcher = vi.fn(async () => response({ message: "rejected" }, 400));
+    const identifier = new Proxy(
+      { customerId: "customer-1" },
+      {
+        get(source, key, receiver) {
+          if (key === "customerId") reads.push("customerId");
+          return Reflect.get(source, key, receiver);
+        },
+      }
+    );
+    const args = new Proxy(
+      {
+        featureId: "messages",
+        operationId: "operation",
+        get payload() {
+          reads.push("payload");
+          return "built";
+        },
+      },
+      {
+        get(source, key, receiver) {
+          if (key === "operationId") reads.push("operationId");
+          return Reflect.get(source, key, receiver);
+        },
+      }
+    );
+    const autumn = new Autumn({} as never, {
+      secretKey: "test-secret-key",
+      serverURL: "https://example.test",
+      operationNamespace: "namespace-1",
+      identify: async () => identifier,
+      fetcher,
+    });
+
+    await autumn.track(null, args).catch(() => undefined);
+
+    expect(reads).toEqual([
+      "customerId",
+      "operationId",
+      "payload",
+      "customerId",
+      "customerId",
+      "operationId",
+    ]);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  test.each([
+    [
+      "missing multi-attach plans",
+      (autumn: Autumn<null>) =>
+        autumn.billing.multiAttach(null, {
+          operationId: "missing-plans",
+        } as never),
+    ],
+    [
+      "null multi-attach plans",
+      (autumn: Autumn<null>) =>
+        autumn.billing.multiAttach(null, {
+          plans: null,
+          operationId: "null-plans",
+        } as never),
+    ],
+    [
+      "sparse multi-attach plans",
+      (autumn: Autumn<null>) =>
+        autumn.billing.multiAttach(null, {
+          plans: new Array(1),
+          operationId: "sparse-plans",
+        } as never),
+    ],
+    [
+      "primitive multi-attach plan",
+      (autumn: Autumn<null>) =>
+        autumn.billing.multiAttach(null, {
+          plans: [1],
+          operationId: "primitive-plan",
+        } as never),
+    ],
+    [
+      "undefined multi-update entry",
+      (autumn: Autumn<null>) =>
+        autumn.billing.multiUpdate(null, {
+          updates: [undefined],
+          operationId: "undefined-update",
+        } as never),
+    ],
+    [
+      "wrong aggregate custom range",
+      (autumn: Autumn<null>) =>
+        autumn.events.aggregate(null, {
+          featureId: "messages",
+          customRange: { start: null, end: [] },
+        } as never),
+    ],
+    [
+      "wrong list custom range",
+      (autumn: Autumn<null>) =>
+        autumn.events.list(null, {
+          customRange: { start: null, end: [] },
+        } as never),
+    ],
+  ])("leaves %s shape rejection to the SDK", async (_name, execute) => {
+    const fetcher = vi.fn();
+
+    const caught = await execute(client(fetcher)).catch((error) => error);
+
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).not.toBeInstanceOf(TypeError);
     expect(fetcher).not.toHaveBeenCalled();
   });
 });

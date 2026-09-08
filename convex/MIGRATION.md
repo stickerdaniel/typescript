@@ -94,6 +94,36 @@ result. A caller that repeats a mutation after an unknown outcome must reconcile
 it against Autumn first. See the README section on duplicate suppression and its
 limits.
 
+## Request snapshots
+
+Direct-method requests are now detached from caller-owned data before any
+package rule or SDK schema reads them. Payload getters run once during that
+materialization, and later mutations to caller objects, arrays, dates or bytes
+cannot change the provider body. A rejected snapshot makes no provider request.
+
+The compatibility boundary is deliberately closed:
+
+- `Date` and `Uint8Array` normalize only in supported root free-value records:
+  check and track `properties`, attach and setup-payment
+  `checkoutSessionParams`, update `subscriptionParams`, and customer `metadata`.
+- Billing `metadata` and aggregate-event `filterBy` remain string records. Their
+  values receive no native-value normalization.
+- SDK records include non-enumerable string keys, reject symbol keys and skip a
+  direct `__proto__` key without evaluating it. Other request records reject
+  non-enumerable own string fields.
+- Classes, boxed primitives, unsupported typed arrays and other exotic objects
+  now fail locally. Array holes and array `undefined` entries become `null`;
+  object fields containing `undefined` are omitted.
+- Shared references remain valid inside one policy domain. Sharing an object
+  between a free-value and strict position now fails locally.
+- `customerId` and `operationId` must be stable own primitive string data
+  properties. Accessors, inherited fields, contradictory proxy reads and
+  mid-request changes are rejected without selecting another idempotency key.
+
+Review direct-method callers that supplied custom classes, non-enumerable fields
+outside an SDK record, or reused one object across fields with different request
+semantics. Convert those values to plain JSON data before calling this package.
+
 ## Method mapping
 
 | Legacy method or action                     | 1.0.0 replacement                                                       |

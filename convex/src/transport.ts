@@ -13,7 +13,12 @@ import {
   AutumnConfigurationError,
   AutumnIndeterminateError,
 } from "./errors.js";
-import { validateJsonRequest } from "./serialization.js";
+import { snapshotJsonRequest } from "./serialization.js";
+import type {
+  NativeOperation,
+  NativeRequestByOperation,
+  NativeRequestSnapshot,
+} from "./types.js";
 
 const API_VERSION = "2.3.0";
 const PROTECTED_HEADERS = new Set([
@@ -197,15 +202,25 @@ export class AutumnTransport {
   }
 }
 
-export async function invokeNative<T>(
-  operation: string,
+export type NativeCall<Operation extends NativeOperation, Result> = (
+  request: NativeRequestSnapshot<NativeRequestByOperation[Operation]>,
+  sdk: AutumnSDK,
+  options: AutumnCall["requestOptions"]
+) => Promise<Result>;
+
+export async function invokeNative<Operation extends NativeOperation, Result>(
+  operation: Operation,
   call: AutumnCall,
-  request: unknown,
-  invoke: (sdk: AutumnSDK, options: AutumnCall["requestOptions"]) => Promise<T>
-): Promise<T> {
-  validateJsonRequest(operation, request);
+  request: NativeRequestByOperation[NoInfer<Operation>],
+  invoke: NativeCall<NoInfer<Operation>, Result>,
+  validate?: (
+    request: NativeRequestSnapshot<NativeRequestByOperation[NoInfer<Operation>]>
+  ) => void
+): Promise<Result> {
+  const snapshot = snapshotJsonRequest(operation, request);
+  validate?.(snapshot);
   try {
-    const result = await invoke(call.sdk, call.requestOptions);
+    const result = await invoke(snapshot, call.sdk, call.requestOptions);
     // Track defines a parsed 202 as accepted work that clients must not resend.
     // No other operation in the pinned SDK gives 202 that definitive meaning.
     if (call.status() === 202 && operation !== "track") {
