@@ -430,10 +430,20 @@ describe("Autumn request snapshots", () => {
     const iterator = vi.fn(() => {
       throw new Error("iterator must not run");
     });
-    Object.defineProperty(bytes, Symbol.iterator, { value: iterator });
-    Object.defineProperty(bytes, "extra", {
-      enumerable: true,
-      value: "ignored",
+    const species = vi.fn(() => {
+      throw new Error("species must not run");
+    });
+    const conversion = vi.fn(() => {
+      throw new Error("conversion must not run");
+    });
+    const callerConstructor = {};
+    Object.defineProperty(callerConstructor, Symbol.species, { get: species });
+    Object.defineProperties(bytes, {
+      constructor: { value: callerConstructor },
+      [Symbol.iterator]: { value: iterator },
+      valueOf: { value: conversion },
+      toString: { value: conversion },
+      extra: { enumerable: true, value: "ignored" },
     });
 
     expect(snapshotTrack({ at, bytes }).properties).toEqual({
@@ -442,6 +452,22 @@ describe("Autumn request snapshots", () => {
     });
     expect(dateHook).not.toHaveBeenCalled();
     expect(iterator).not.toHaveBeenCalled();
+    expect(species).not.toHaveBeenCalled();
+    expect(conversion).not.toHaveBeenCalled();
+  });
+
+  test("does not read a caller-owned byte constructor", () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const constructor = vi.fn(() => {
+      throw new Error("constructor must not run");
+    });
+    Object.defineProperty(bytes, "constructor", { get: constructor });
+
+    const snapshot = snapshotTrack({ bytes });
+    bytes[0] = 9;
+
+    expect(snapshot.properties!.bytes).toBe("AQID");
+    expect(constructor).not.toHaveBeenCalled();
   });
 
   test("encodes large byte values without a full argument spread", () => {

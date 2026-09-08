@@ -133,6 +133,17 @@ function defineDataProperty(
   });
 }
 
+function copyUint8Array(source: Uint8Array): Uint8Array {
+  const lengthGetter = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(Uint8Array.prototype),
+    "length"
+  )?.get;
+  if (!lengthGetter) throw new TypeError();
+  const copy = new Uint8Array(lengthGetter.call(source) as number);
+  Uint8Array.prototype.set.call(copy, source);
+  return copy;
+}
+
 function base64(bytes: Uint8Array): string {
   let encoded = "";
   for (let index = 0; index < bytes.length; index += 3) {
@@ -335,7 +346,7 @@ function materialize(operation: NativeOperation, request: object): JsonValue {
       if (!bufferGetter) throw new TypeError();
       const buffer = bufferGetter.call(source);
       if (isSharedArrayBuffer(buffer)) throw new TypeError();
-      const copy = Uint8Array.prototype.slice.call(source) as Uint8Array;
+      const copy = copyUint8Array(source as Uint8Array);
       return complete(source, domain, base64(copy));
     }
     if (Array.isArray(source)) return visitArray(source, domain);
